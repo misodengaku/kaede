@@ -2,23 +2,22 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/urfave/cli"
-
-	"strings"
-
-	"os"
-
-	"runtime"
-
 	"./himawari"
+
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/urfave/cli"
 )
 
 type EpgDatetime int64
@@ -83,6 +82,8 @@ type Devices []Device
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	app := cli.NewApp()
+	db, _ := sql.Open("sqlite3", "./foo.db")
+	defer db.Close()
 	// app.Name = "kaede"
 	// app.Usage = "make an explosive entrance"
 	app.Commands = []cli.Command{
@@ -97,7 +98,7 @@ func main() {
 		},
 		{
 			Name:    "tschscan",
-			Aliases: []string{"c"},
+			Aliases: []string{"t"},
 			Usage:   "scan channel from ts files",
 			Action: func(c *cli.Context) error {
 				channelScanFromTSFiles()
@@ -106,10 +107,58 @@ func main() {
 		},
 		{
 			Name:    "sync",
-			Aliases: []string{"a"},
+			Aliases: []string{"s"},
 			Usage:   "sync",
 			Action: func(c *cli.Context) error {
 				syncFromEpgDump()
+				return nil
+			},
+		},
+		{
+			Name:    "server",
+			Aliases: []string{"f"},
+			Usage:   "server",
+			Action: func(c *cli.Context) error {
+				syncFromEpgDump()
+				return nil
+			},
+		},
+		{
+			Name:    "daemon",
+			Aliases: []string{"f"},
+			Usage:   "daemon",
+			Action: func(c *cli.Context) error {
+				syncFromEpgDump()
+				return nil
+			},
+		},
+		{
+			Name:    "execrecord",
+			Aliases: []string{"r"},
+			Usage:   "execrecord TASKID",
+			Action: func(c *cli.Context) error {
+				if len(c.Args()) < 1 {
+					fmt.Println("schedule id is needed")
+					return nil
+				}
+				fmt.Printf("Hello %q\r\n", c.Args().Get(0))
+				// create table schedule(id integer primary key, schedule_id text not null, start_date text not null, duration integer);
+				// insert into schedule (schedule_id, start_date, duration) values ("test", "2017-03-19T22:24:30+09:00", 1800);
+				sql := fmt.Sprintf(`SELECT * FROM schedule WHERE schedule_id="%s" LIMIT 1;`, c.Args().Get(0))
+				fmt.Println(sql)
+				rows, err := db.Query(sql)
+				defer rows.Close()
+				for rows.Next() {
+					id, scheduleID, dateStr, duration := 0, "", "", 0
+					err = rows.Scan(&id, &scheduleID, &dateStr, &duration)
+					if err != nil {
+						return err
+					}
+
+					fmt.Println(id, scheduleID, dateStr, duration)
+				}
+				fmt.Println("ik")
+				// syncFromEpgDump()
 				return nil
 			},
 		},
@@ -212,10 +261,11 @@ func channelScan() {
 	scantime := 30
 	channelList := []Channel{}
 	devices := deviceMapInit("/dev/pt1video2", "/dev/pt1video3")
+	fmt.Println("channel scan started.")
 
 	for channel := 16; channel < 63; channel++ {
 		d := <-devices.GetDevice()
-		fmt.Println(channel)
+		fmt.Println("scanning:", channel)
 		// fmt.Println("locked", d.Path)
 		// fmt.Println("goroutine", runtime.NumGoroutine())
 
@@ -226,12 +276,12 @@ func channelScan() {
 				// fmt.Println("unlocked", device.Path)
 			}()
 			// fmt.Println("start scan", ch, device.Path)
-			cmd := exec.Command("recpt1", "--b25", "--strip", strconv.Itoa(ch), "1", "/dev/null", "--device", device.Path)
+			cmd := exec.Command("recpt1", "--b25", "--strip", strconv.Itoa(ch), "3", "/dev/null", "--device", device.Path)
 			errPipe, _ := cmd.StderrPipe()
 			scanner := bufio.NewScanner(errPipe)
 			isTuned := make(chan bool)
 
-			go func() { // 解放OK
+			go func() {
 				for scanner.Scan() {
 					if strings.Contains(scanner.Text(), "C/N") {
 						// fmt.Println("\tchannel tuned.", ch, device.Path)
@@ -249,6 +299,7 @@ func channelScan() {
 			cmd.Start()
 
 			if !<-isTuned {
+				// チューニング失敗
 				// fmt.Println("tunning fail", device.Path)
 				return
 			}
@@ -257,20 +308,24 @@ func channelScan() {
 			time.Sleep(wait)
 			fmt.Println(ch, "name scanning...", device.Path)
 
-			result := scanStationName(device, ch, scantime)
 			channel := Channel{PhysicalChannel: ch}
-			if result != nil {
-				channel.LogicalChannels = result
-				fmt.Println("detect: ", channel.PhysicalChannel, channel.LogicalChannels, device.Path)
-			} else {
-				fmt.Println("\tstation scan fail: ", ch, device.Path)
+			for i := 0; i < 3; i++ {
+				result := scanStationName(device, ch, scantime)
+				if result != nil {
+					channel.LogicalChannels = result
+					fmt.Println("detect: ", channel.PhysicalChannel, channel.LogicalChannels, device.Path)
+					channelList = append(channelList, channel)
+					break
+				} else {
+					fmt.Println("\tstation scan fail: ", ch, device.Path, "retrying...")
+					time.Sleep(wait * 2)
+				}
 			}
-			channelList = append(channelList, channel)
 			// fmt.Println("scan complete", device.Path)
 		}(channel, d)
 	}
 
-	chb, _ := json.Marshal(channelList)
+	chb, _ := json.MarshalIndent(channelList, "", "\t")
 	ioutil.WriteFile("channelList.json", chb, 666)
 
 }
@@ -293,10 +348,24 @@ func syncFromEpgDump() {
 		fmt.Println(fi.Name())
 
 		epg := dumpTS(fname)
+		workQueue := make(chan himawari.Program, 100)
+		go func() {
+			for {
+				ps := <-workQueue
+				ps.UploadProgram()
+			}
+		}()
 
 		// return
 		for _, v := range epg {
-			himawari.CreateStation(&v.BroadcastStation)
+			v.BroadcastStation.StationID = v.ID
+			_, err := himawari.GetStation(v.ID)
+			if err != nil {
+				if err.Error() == "HTTP Error: 404" {
+					// 局が存在しない場合作成
+					himawari.CreateStation(&v.BroadcastStation)
+				}
+			}
 
 			pc := make(chan struct{}, len(v.Programs))
 			for _, p := range v.Programs {
@@ -307,25 +376,24 @@ func syncFromEpgDump() {
 				ps.End = p.End.GetTime()
 				ps.Title = p.Title
 				ps.Detail = p.Detail
-				fmt.Println(ps.Title)
+				// fmt.Println(ps.Title)
 				ps.Categories = []himawari.Category{}
 				for _, c := range p.Category {
 					ch, _ := himawari.SearchCategories(c.Large.JaJP, c.Middle.JaJP)
-					fmt.Printf("%#v", ch)
+					// fmt.Printf("%#v", ch)
 					if len(ch) < 1 {
 						fmt.Printf("error \"%s\" \"%s\"\r\n", c.Large.JaJP, c.Middle.JaJP)
 					}
 					ps.Categories = append(ps.Categories, ch[0])
 				}
-				ps.UploadProgram()
-				time.Sleep(10 * time.Millisecond)
+				// time.Sleep(100 * time.Mill	isecond)
+				workQueue <- ps
 				pc <- struct{}{}
 			}
 			for i := 0; i < len(v.Programs); i++ {
 				<-pc
 			}
 			fmt.Println(len(v.Programs), "registered")
-			time.Sleep(1 * time.Second)
 
 		}
 	}

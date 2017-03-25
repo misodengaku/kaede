@@ -7,21 +7,15 @@ import (
 	"io/ioutil"
 	"net/http"
 )
-
-type BroadcastStation struct {
-	StationID         string `json:"station_id"` // チャンネルと関連付け
-	TransportStreamID int    `json:"transport_stream_id"`
-	OriginalNetworkID int    `json:"original_network_id"`
-	ServiceID         int    `json:"service_id"`
-	Name              string `json:"name"`
-}
-
 func GetStation(id string) (*BroadcastStation, error) {
 
 	r, err := http.Get("http://172.31.125.100:8080/v1/broadcaststations/" + id)
 	if err != nil {
 		fmt.Printf("%#v\r\n", r)
 		return nil, err
+	}
+	if r.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP Error: %d", r.StatusCode)
 	}
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
